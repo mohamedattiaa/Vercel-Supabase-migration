@@ -1,0 +1,259 @@
+name: Smart Migrations 
+
+on:
+  push:
+    branches:
+      - v0_updates
+
+concurrency:
+  group: smart-migration
+  cancel-in-progress: true
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Setup migration tracking
+        env:
+          RAW_DB_URL: ${{ secrets.SUPABASE_DIRECT_URL }}
+        run: |
+          SUPABASE_DB_URL="$(echo "$RAW_DB_URL" | tr -d '\n\r ')"
+          
+          echo "=================================================="
+          echo "🔧 Setting up migration tracking system"
+          echo "=================================================="
+          echo ""
+          
+          # Check if the enhanced migration_history table already exists
+          TABLE_EXISTS=$(psql "$SUPABASE_DB_URL" -t -c "
+            SELECT EXISTS (
+              SELECT FROM information_schema.tables 
+              WHERE table_schema = 'public' 
+              AND table_name = 'migration_history'
+            );
+          " | xargs)
+          
+          if [ "$TABLE_EXISTS" = "f" ]; then
+            echo "📋 Creating new migration_history table..."
+            
+            # Run the migration_history creation file
+            if [ -f "supabase/migrations/migration_history.sql" ]; then
+              psql "$SUPABASE_DB_URL" -f "supabase/migrations/migration_history.sql"
+              echo "✅ Enhanced migration tracking table created"
+            else
+              echo "❌ migration_history.sql not found!"
+              exit 1
+            fi
+          else
+            echo "✅ Migration tracking table already exists"
+            
+            # Verify it has the new structure
+            COLUMN_COUNT=$(psql "$SUPABASE_DB_URL" -t -c "
+              SELECT COUNT(*) 
+              FROM information_schema.columns 
+              WHERE table_schema = 'public' 
+              AND table_name = 'migration_history';
+            " | xargs)
+            
+            if [ "$COLUMN_COUNT" -lt 7 ]; then
+              echo "⚠️  WARNING: migration_history table has old structure ($COLUMN_COUNT columns)"
+              echo "⚠️  Expected 7 columns. Please drop and recreate the table:"
+              echo "⚠️  DROP TABLE public.migration_history CASCADE;"
+              exit 1
+            else
+              echo "✅ Table structure verified ($COLUMN_COUNT columns)"
+            fi
+          fi
+          
+          echo ""
+
+      - name: Run new migrations only
+        env:
+          RAW_DB_URL: ${{ secrets.SUPABASE_DIRECT_URL }}
+        run: |
+          SUPABASE_DB_URL="$(echo "$RAW_DB_URL" | tr -d '\n\r ')"
+          
+          echo "=================================================="
+          echo "🚀 Checking for new migrations"
+          echo "=================================================="
+          echo ""
+          
+          # Get list of already applied migrations
+          psql "$SUPABASE_DB_URL" -t -c "SELECT filename FROM public.migration_history WHERE status = 'success' ORDER BY filename;" > /tmp/applied.txt
+          
+          echo "📋 Already applied migrations:"
+          cat /tmp/applied.txt
+          echo ""
+          
+          # Track if we ran any migrations
+          MIGRATIONS_RUN=0
+          
+          # Loop through migration files
+          for migration_file in supabase/migrations/*.sql; do
+            if [ -f "$migration_file" ]; then
+              filename=$(basename "$migration_file")
+              
+              # Skip the migration_history.sql file itself
+              if [ "$filename" = "migration_history.sql" ]; then
+                echo "⏭️  SKIP: $filename (system file)"
+                continue
+              fi
+              
+              # Validate file has actual content (not empty or only comments)
+              ACTUAL_CONTENT=$(grep -v '^[[:space:]]*$' "$migration_file" | grep -v '^[[:space:]]*--' | wc -l)
+              
+              if [ "$ACTUAL_CONTENT" -eq 0 ]; then
+                echo "⚠️  SKIP: $filename (empty file - no SQL content found)"
+                continue
+              fi
+              
+              # Check if this migration was already applied
+              if grep -Fxq " $filename" /tmp/applied.txt; then
+                echo "⏭️  SKIP: $filename (already applied)"
+              else
+                echo ""
+                echo "=================================================="
+                echo "🆕 NEW MIGRATION: $filename"
+                echo "=================================================="
+                
+                # Calculate checksum
+                CHECKSUM=$(md5sum "$migration_file" | awk '{print $1}')
+                echo "🔐 Checksum: $CHECKSUM"
+                
+                # Start timing
+                START_TIME=$(date +%s%3N)
+                
+                # Run the migration
+                psql "$SUPABASE_DB_URL" -f "$migration_file"
+                MIGRATION_EXIT_CODE=$?
+                
+                # End timing
+                END_TIME=$(date +%s%3N)
+                EXECUTION_TIME=$((END_TIME - START_TIME))
+                
+                if [ $MIGRATION_EXIT_CODE -eq 0 ]; then
+                  # Detect migration type from filename or content
+                  MIGRATION_TYPE="other"
+                  if echo "$filename" | grep -qi "create.*table"; then
+                    MIGRATION_TYPE="new_table"
+                  elif echo "$filename" | grep -qi "add.*column"; then
+                    MIGRATION_TYPE="new_column"
+                  elif echo "$filename" | grep -qi "modify.*column\|alter.*column"; then
+                    MIGRATION_TYPE="modify_column"
+                  elif echo "$filename" | grep -qi "drop.*column\|delete.*column"; then
+                    MIGRATION_TYPE="delete_column"
+                  elif echo "$filename" | grep -qi "index"; then
+                    MIGRATION_TYPE="new_index"
+                  elif echo "$filename" | grep -qi "rls\|policy"; then
+                    MIGRATION_TYPE="rls_policy"
+                  fi
+                  
+                  # Record that we applied this migration with full metadata
+                  psql "$SUPABASE_DB_URL" -c "
+                    INSERT INTO public.migration_history 
+                      (filename, checksum, applied_by, status, execution_time_ms, migration_type) 
+                    VALUES 
+                      ('$filename', '$CHECKSUM', 'GitHub Actions CI/CD', 'success', $EXECUTION_TIME, '$MIGRATION_TYPE')
+                    ON CONFLICT (filename) DO NOTHING;
+                  "
+                  
+                  echo ""
+                  echo "✅ SUCCESS: $filename applied in ${EXECUTION_TIME}ms"
+                  echo "📝 Type: $MIGRATION_TYPE"
+                  MIGRATIONS_RUN=$((MIGRATIONS_RUN + 1))
+                else
+                  # Record failure
+                  psql "$SUPABASE_DB_URL" -c "
+                    INSERT INTO public.migration_history 
+                      (filename, checksum, applied_by, status, execution_time_ms, migration_type) 
+                    VALUES 
+                      ('$filename', '$CHECKSUM', 'GitHub Actions CI/CD', 'failed', $EXECUTION_TIME, 'other')
+                    ON CONFLICT (filename) DO UPDATE 
+                    SET status = 'failed', execution_time_ms = $EXECUTION_TIME;
+                  "
+                  
+                  echo ""
+                  echo "❌ FAILED: $filename"
+                  exit 1
+                fi
+              fi
+            fi
+          done
+          
+          echo ""
+          echo "=================================================="
+          if [ $MIGRATIONS_RUN -eq 0 ]; then
+            echo "✨ No new migrations to run - database is up to date!"
+          else
+            echo "✅ Successfully applied $MIGRATIONS_RUN new migration(s)"
+          fi
+          echo "=================================================="
+
+      - name: Show current state
+        env:
+          RAW_DB_URL: ${{ secrets.SUPABASE_DIRECT_URL }}
+        run: |
+          SUPABASE_DB_URL="$(echo "$RAW_DB_URL" | tr -d '\n\r ')"
+          
+          echo ""
+          echo "=================================================="
+          echo "📊 CURRENT DATABASE STATE"
+          echo "=================================================="
+          echo ""
+          
+          echo "📋 Migration History:"
+          echo "--------------------------------------------------"
+          psql "$SUPABASE_DB_URL" -c "
+            SELECT 
+              filename,
+              LEFT(checksum, 8) as checksum_short,
+              applied_at::timestamp(0) as applied_at,
+              applied_by,
+              status,
+              execution_time_ms as exec_time_ms,
+              migration_type
+            FROM public.migration_history 
+            ORDER BY applied_at DESC
+            LIMIT 10;
+          "
+          echo ""
+          
+          echo "📊 All Tables:"
+          echo "--------------------------------------------------"
+          psql "$SUPABASE_DB_URL" -c "
+            SELECT 
+              tablename,
+              pg_size_pretty(pg_total_relation_size('public.' || tablename)) as size
+            FROM pg_tables 
+            WHERE schemaname = 'public'
+            ORDER BY tablename;
+          "
+          echo ""
+          
+          echo "🔒 RLS Status:"
+          echo "--------------------------------------------------"
+          psql "$SUPABASE_DB_URL" -c "
+            SELECT 
+              t.tablename,
+              CASE WHEN c.relrowsecurity THEN '🔒 Enabled' ELSE '🔓 Disabled' END as rls_status,
+              COUNT(p.policyname) as policy_count
+            FROM pg_tables t
+            JOIN pg_class c ON c.relname = t.tablename AND c.relnamespace = 'public'::regnamespace
+            LEFT JOIN pg_policies p ON p.tablename = t.tablename AND p.schemaname = 'public'
+            WHERE t.schemaname = 'public'
+            GROUP BY t.tablename, c.relrowsecurity
+            ORDER BY t.tablename;
+          "
+          echo ""
+          
+          echo "=================================================="
+          echo "✅ STATE CHECK COMPLETE"
+          echo "=================================================="
